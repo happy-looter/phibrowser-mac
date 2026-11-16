@@ -327,6 +327,14 @@ final class FloatingSidebarHostViewController: NSViewController {
     static let floatingSidebarMinimumVisibleDuration: TimeInterval = 0.5
     static let floatingSidebarInset: CGFloat = 5
     static let floatingSidebarShowDuration: TimeInterval = 0.15
+    /// The hover slide-in is a spring that lands `floatingSidebarSpringOvershoot`
+    /// past rest at any panel width, peaking at about 0.11–0.13 s and settled
+    /// within a quarter second (`floatingSidebarSpringDamping(travel:)`).
+    static let floatingSidebarSpringStiffness: CGFloat = 2000
+    static let floatingSidebarSpringMass: CGFloat = 1
+    static let floatingSidebarSpringOvershoot: CGFloat = 5
+    /// The running slide-in spring on the panel's layer; a hide drops it.
+    static let floatingSidebarSlideInAnimationKey = "floatingSidebarSlideIn"
     static let floatingSidebarHideDuration: TimeInterval = 0.15
     /// Quiet period after the docked column's last width change before the
     /// hidden panel follows it; shorter than the trigger's enable delay after
@@ -360,6 +368,23 @@ final class FloatingSidebarHostViewController: NSViewController {
 
     var floatingSidebarHiddenLeading: CGFloat {
         (sidebarOnRight ? 1 : -1) * (currentFloatingWidth + Self.floatingSidebarInset)
+    }
+
+    /// With Reduce Motion on, the slide-in keeps its plain ease-out. Read at
+    /// each show; tests replace it.
+    var prefersReducedMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    /// The spring's damping for a slide of `travel` points, so every panel
+    /// width lands the same `floatingSidebarSpringOvershoot` past rest: an
+    /// underdamped spring overshoots by e^(−ζπ/√(1−ζ²)) of its travel, solved
+    /// here for the damping ratio ζ. A slide no longer than the bounce is
+    /// critically damped and does not overshoot.
+    static func floatingSidebarSpringDamping(travel: CGFloat) -> CGFloat {
+        let critical = 2 * (floatingSidebarSpringStiffness * floatingSidebarSpringMass).squareRoot()
+        guard travel > floatingSidebarSpringOvershoot else { return critical }
+        let logShare = log(floatingSidebarSpringOvershoot / travel)
+        let ratio = -logShare / (CGFloat.pi * CGFloat.pi + logShare * logShare).squareRoot()
+        return ratio * critical
     }
 
     func setupFloatingSidebarTrigger() {
@@ -701,18 +726,44 @@ final class FloatingSidebarHostViewController: NSViewController {
         }
 
         floatingSidebarLeadingConstraint?.update(offset: 0)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.floatingSidebarShowDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            context.allowsImplicitAnimation = true
-            self.view.layoutSubtreeIfNeeded()
+        if prefersReducedMotion() {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = Self.floatingSidebarShowDuration
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                context.allowsImplicitAnimation = true
+                self.view.layoutSubtreeIfNeeded()
+            }
+        } else {
+            springFloatingSidebarIntoPlace(panel)
         }
+    }
+
+    /// Lays the panel out at rest, then plays the travel in from
+    /// `floatingSidebarHiddenLeading` as a spring on the layer. The model
+    /// frame is final at once, so the panel is hit-testable where it lands.
+    /// The spring removes itself once settled; `hideFloatingSidebar(animated:)`
+    /// drops it sooner.
+    private func springFloatingSidebarIntoPlace(_ panel: NSView) {
+        view.layoutSubtreeIfNeeded()
+        guard let layer = panel.layer else { return }
+        let travel = floatingSidebarHiddenLeading
+        let spring = CASpringAnimation(keyPath: "transform.translation.x")
+        spring.stiffness = Self.floatingSidebarSpringStiffness
+        spring.mass = Self.floatingSidebarSpringMass
+        spring.damping = Self.floatingSidebarSpringDamping(travel: abs(travel))
+        spring.fromValue = travel
+        spring.toValue = CGFloat(0)
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: Self.floatingSidebarSlideInAnimationKey)
     }
 
     func hideFloatingSidebar(animated: Bool) {
         cancelFloatingSidebarHide()
         guard let panel = floatingSidebarContainerView else { return }
         guard panel.isHidden == false else { return }
+        // Pointer hides wait out `floatingSidebarMinimumVisibleDuration`, longer
+        // than the spring; only a forced hide can meet one still running.
+        panel.layer?.removeAnimation(forKey: Self.floatingSidebarSlideInAnimationKey)
         returnKeyboardToFullscreenPage(from: panel)
         floatingSidebarViewController?.setMediaPresented(false)
         // A forced hide (sidebar expanding, window ordering out) takes the
